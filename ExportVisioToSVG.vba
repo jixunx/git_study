@@ -14,9 +14,6 @@ Option Explicit
 ' ---------- 可修改的参数 ----------
 ' 默认输出目录，留空则运行时弹窗选择
 Private Const DEFAULT_OUTPUT_DIR As String = ""
-
-' 内容周围保留的边距（单位：英寸）。0 = 紧贴内容边界；建议值 0.1
-Private Const CONTENT_MARGIN_INCH As Double = 0
 ' ----------------------------------
 
 ' 入口：导出当前活动文档的所有 Page 为 SVG
@@ -79,10 +76,10 @@ Private Function ExportPages(doc As Visio.Document, outputDir As String) As Long
     ExportPages = count
 End Function
 
-' 将图纸临时缩到内容边界后导出为 SVG，完成后通过 Undo Scope 回滚图纸尺寸。
-' 原理：Visio SVG 导出以 PageWidth/PageHeight 为 viewBox；
-'       ResizeToFitContents 将图纸收缩至所有形状的外接矩形，
-'       使导出的 SVG 中内容充满整张图纸。
+' 将图纸临时缩到内容边界后导出为 SVG，完成后还原图纸尺寸，不修改原文件。
+' 原理：Visio SVG 导出以 PageWidth/PageHeight 作为 viewBox；
+'       ResizeToFitContents（无参数，兼容 Visio 2016）将图纸收缩至所有形状的
+'       外接矩形，使导出的 SVG 中内容充满整张图纸。
 Private Sub ExportPageFitContent(page As Visio.Page, svgPath As String)
     ' 若页面没有任何形状，直接导出即可
     If page.Shapes.Count = 0 Then
@@ -90,26 +87,34 @@ Private Sub ExportPageFitContent(page As Visio.Page, svgPath As String)
         Exit Sub
     End If
 
-    ' 开启一个 Undo Scope，所有在此范围内对文档的修改都可一键回滚
-    Dim scopeID As Long
-    scopeID = Application.BeginUndoScope("TempResizeForSVGExport")
+    Dim ps As Visio.Shape
+    Set ps = page.PageSheet
 
-    On Error GoTo ErrHandler
+    ' --- 保存原始图纸属性 ---
+    Dim origW  As Double: origW  = ps.CellsU("PageWidth").ResultIU
+    Dim origH  As Double: origH  = ps.CellsU("PageHeight").ResultIU
+    Dim origOX As Double: origOX = ps.CellsU("DrawingOffsetX").ResultIU
+    Dim origOY As Double: origOY = ps.CellsU("DrawingOffsetY").ResultIU
 
-    ' 将图纸尺寸收缩到内容边界（加上可选边距）
-    page.ResizeToFitContents CONTENT_MARGIN_INCH
+    On Error GoTo Restore
+
+    ' ResizeToFitContents 不传参数（Visio 2016 兼容写法）
+    page.ResizeToFitContents
 
     ' 导出 SVG（此时 PageWidth/PageHeight 已等于内容区域大小）
     page.Export svgPath
 
-    ' 回滚（bCommit = False），还原图纸尺寸，不污染原文件
-    Application.EndUndoScope scopeID, False
-    Exit Sub
+Restore:
+    ' 无论导出成功与否，都还原图纸尺寸，保持原文件不变
+    On Error Resume Next
+    ps.CellsU("PageWidth").ResultIU    = origW
+    ps.CellsU("PageHeight").ResultIU   = origH
+    ps.CellsU("DrawingOffsetX").ResultIU = origOX
+    ps.CellsU("DrawingOffsetY").ResultIU = origOY
 
-ErrHandler:
-    ' 出错时同样回滚，然后降级为直接导出原始页面
-    Application.EndUndoScope scopeID, False
-    page.Export svgPath
+    ' 清除"已修改"标记，防止关闭时提示保存
+    page.Document.Saved = True
+    On Error GoTo 0
 End Sub
 
 ' 移除文件名中的非法字符
