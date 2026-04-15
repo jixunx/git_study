@@ -1,27 +1,28 @@
 ' ExportVisioToSVG.vba
 ' 将 Visio 文件中每个 Page 导出为 SVG 文件，文件名以 Sheet（Page）名称命名。
-' 导出时临时将图纸尺寸收缩到内容边界，使内容充满整个 SVG 图纸；
-' 导出完成后通过 Undo Scope 自动回滚，不修改原文件。
+'
+' 核心策略：先按原始图纸尺寸导出 SVG，再通过 MSXML 修改 SVG 的 viewBox 属性，
+' 使图形内容充满整张图纸。全程不修改 Visio 文档。
 '
 ' 使用方法：
 '   1. 打开 Visio，按 Alt+F11 打开 VBA 编辑器
 '   2. 插入 > 模块，将此代码粘贴进去
-'   3. 修改下方常量（或运行时弹窗选择目录）
+'   3. 修改下方 DEFAULT_OUTPUT_DIR 常量（或运行时弹窗选择目录）
 '   4. 运行 ExportAllPagesToSVG 宏
 
 Option Explicit
 
-' ---------- 可修改的参数 ----------
 ' 默认输出目录，留空则运行时弹窗选择
 Private Const DEFAULT_OUTPUT_DIR As String = ""
-' ----------------------------------
 
-' 入口：导出当前活动文档的所有 Page 为 SVG
+' ==============================================================
+' 入口
+' ==============================================================
+
 Public Sub ExportAllPagesToSVG()
     Dim doc As Visio.Document
     Dim outputDir As String
 
-    ' 确保有打开的文档
     If Visio.Documents.Count = 0 Then
         MsgBox "没有打开的 Visio 文档，请先打开一个 .vsdx 文件。", vbExclamation
         Exit Sub
@@ -29,7 +30,6 @@ Public Sub ExportAllPagesToSVG()
 
     Set doc = Visio.ActiveDocument
 
-    ' 确定输出目录
     outputDir = Trim(DEFAULT_OUTPUT_DIR)
     If outputDir = "" Then
         outputDir = BrowseForFolder("请选择 SVG 文件的输出目录")
@@ -39,10 +39,8 @@ Public Sub ExportAllPagesToSVG()
         End If
     End If
 
-    ' 确保路径以路径分隔符结尾
     If Right(outputDir, 1) <> "\" Then outputDir = outputDir & "\"
 
-    ' 导出每个 Page
     Dim exported As Long
     exported = ExportPages(doc, outputDir)
 
@@ -50,72 +48,165 @@ Public Sub ExportAllPagesToSVG()
            "输出目录：" & outputDir, vbInformation
 End Sub
 
-' 遍历文档中所有 Page 并逐一导出为 SVG
-' 返回成功导出的页面数量
+' ==============================================================
+' 遍历页面
+' ==============================================================
+
 Private Function ExportPages(doc As Visio.Document, outputDir As String) As Long
     Dim page As Visio.Page
     Dim count As Long
-
     count = 0
 
     For Each page In doc.Pages
-        ' 使用 Page 名称作为文件名，清理非法字符
         Dim safeName As String
         safeName = SanitizeFileName(page.Name)
 
-        ' 若同名文件已存在则加序号避免覆盖
         Dim finalPath As String
         finalPath = UniqueFilePath(outputDir & safeName & ".svg")
 
-        ' 临时收缩图纸到内容边界后导出，导出后自动还原
         ExportPageFitContent page, finalPath
-
         count = count + 1
     Next page
 
     ExportPages = count
 End Function
 
-' 将图纸临时缩到内容边界后导出为 SVG，完成后还原图纸尺寸，不修改原文件。
-' 原理：Visio SVG 导出以 PageWidth/PageHeight 作为 viewBox；
-'       ResizeToFitContents（无参数，兼容 Visio 2016）将图纸收缩至所有形状的
-'       外接矩形，使导出的 SVG 中内容充满整张图纸。
+' ==============================================================
+' 导出单页并裁剪 viewBox
+' ==============================================================
+
+' 先按原始尺寸导出 SVG（不改动 Visio 文档），
+' 再计算所有形状的外接矩形，更新 SVG 的 viewBox，使内容充满图纸。
 Private Sub ExportPageFitContent(page As Visio.Page, svgPath As String)
-    ' 若页面没有任何形状，直接导出即可
-    If page.Shapes.Count = 0 Then
-        page.Export svgPath
-        Exit Sub
-    End If
-
-    Dim ps As Visio.Shape
-    Set ps = page.PageSheet
-
-    ' --- 保存原始图纸属性 ---
-    Dim origW  As Double: origW  = ps.CellsU("PageWidth").ResultIU
-    Dim origH  As Double: origH  = ps.CellsU("PageHeight").ResultIU
-    Dim origOX As Double: origOX = ps.CellsU("DrawingOffsetX").ResultIU
-    Dim origOY As Double: origOY = ps.CellsU("DrawingOffsetY").ResultIU
-
-    On Error GoTo Restore
-
-    ' ResizeToFitContents 不传参数（Visio 2016 兼容写法）
-    page.ResizeToFitContents
-
-    ' 导出 SVG（此时 PageWidth/PageHeight 已等于内容区域大小）
+    ' 1. 正常导出
     page.Export svgPath
 
-Restore:
-    ' 无论导出成功与否，都还原图纸尺寸，保持原文件不变
-    On Error Resume Next
-    ps.CellsU("PageWidth").ResultIU    = origW
-    ps.CellsU("PageHeight").ResultIU   = origH
-    ps.CellsU("DrawingOffsetX").ResultIU = origOX
-    ps.CellsU("DrawingOffsetY").ResultIU = origOY
+    ' 无形状则无需调整
+    If page.Shapes.Count = 0 Then Exit Sub
 
-    ' 清除"已修改"标记，防止关闭时提示保存
-    page.Document.Saved = True
-    On Error GoTo 0
+    ' 2. 计算形状外接矩形（Visio 绘图坐标，单位：英寸）
+    Dim minX As Double, minY As Double, maxX As Double, maxY As Double
+    If Not GetShapesBBox(page, minX, minY, maxX, maxY) Then Exit Sub
+
+    ' 3. 修改 SVG 的 viewBox
+    AdjustSVGViewBox svgPath, page, minX, minY, maxX, maxY
 End Sub
+
+' ==============================================================
+' 计算所有形状的外接矩形
+' ==============================================================
+
+' 遍历页面所有顶层形状，返回它们的联合外接矩形。
+' 使用 Visio 绘图坐标（原点在页面左下角，Y 轴向上，单位：英寸）。
+' 返回 True 表示至少找到一个有效形状。
+Private Function GetShapesBBox(page As Visio.Page, _
+                                ByRef minX As Double, ByRef minY As Double, _
+                                ByRef maxX As Double, ByRef maxY As Double) As Boolean
+    Dim shp As Visio.Shape
+    Dim l As Double, b As Double, r As Double, t As Double
+    Dim errNum As Long
+    Dim found As Boolean: found = False
+
+    For Each shp In page.Shapes
+        On Error Resume Next
+        ' 4 = visBBoxDrawingCoords，使用绘图坐标系
+        shp.BoundingBox 4, l, b, r, t
+        errNum = Err.Number
+        On Error GoTo 0
+
+        If errNum = 0 And r > l And t > b Then
+            If Not found Then
+                minX = l: minY = b: maxX = r: maxY = t
+                found = True
+            Else
+                If l < minX Then minX = l
+                If b < minY Then minY = b
+                If r > maxX Then maxX = r
+                If t > maxY Then maxY = t
+            End If
+        End If
+    Next shp
+
+    GetShapesBBox = found
+End Function
+
+' ==============================================================
+' 修改 SVG 的 viewBox
+' ==============================================================
+
+' 通过 MSXML 读取已导出的 SVG，根据形状外接矩形重算 viewBox，写回文件。
+' 原理：
+'   Visio 导出的 SVG viewBox = "0 0 PageW PageH"（SVG 内部单位）
+'   通过比例换算，将 Visio 绘图坐标（英寸）映射到 SVG 坐标。
+'   注意：Visio Y 轴向上，SVG Y 轴向下，需翻转。
+Private Sub AdjustSVGViewBox(svgPath As String, page As Visio.Page, _
+                               minX As Double, minY As Double, _
+                               maxX As Double, maxY As Double)
+    ' 读取页面原始尺寸（英寸）
+    Dim ps As Visio.Shape: Set ps = page.PageSheet
+    Dim pageW As Double: pageW = ps.CellsU("PageWidth").ResultIU
+    Dim pageH As Double: pageH = ps.CellsU("PageHeight").ResultIU
+    If pageW <= 0 Or pageH <= 0 Then Exit Sub
+
+    ' 创建 MSXML 解析器
+    Dim xml As Object
+    On Error Resume Next
+    Set xml = CreateObject("MSXML2.DOMDocument.6.0")
+    On Error GoTo 0
+    If xml Is Nothing Then Exit Sub
+
+    xml.async = False
+    xml.validateOnParse = False
+    xml.resolveExternals = False
+
+    If Not xml.Load(svgPath) Then Exit Sub
+    If xml.parseError.errorCode <> 0 Then Exit Sub
+
+    Dim root As Object: Set root = xml.documentElement
+    If root Is Nothing Then Exit Sub
+
+    ' 读取现有 viewBox（格式："x y w h"）
+    Dim vbStr As String: vbStr = root.getAttribute("viewBox")
+    If vbStr = "" Then Exit Sub
+
+    ' 清理分隔符，确保只有单个空格
+    vbStr = Replace(vbStr, ",", " ")
+    Do While InStr(vbStr, "  ") > 0
+        vbStr = Replace(vbStr, "  ", " ")
+    Loop
+    Dim parts() As String: parts = Split(Trim(vbStr), " ")
+    If UBound(parts) < 3 Then Exit Sub
+
+    Dim svgFullW As Double: svgFullW = CDbl(parts(2))   ' 全页宽度（SVG 内部单位）
+    Dim svgFullH As Double: svgFullH = CDbl(parts(3))   ' 全页高度（SVG 内部单位）
+    If svgFullW <= 0 Or svgFullH <= 0 Then Exit Sub
+
+    ' 换算比例：Visio 英寸 → SVG 内部单位
+    Dim scaleX As Double: scaleX = svgFullW / pageW
+    Dim scaleY As Double: scaleY = svgFullH / pageH
+
+    ' 计算新 viewBox（Y 轴翻转：SVG Y = (pageH - visioY) * scaleY）
+    Dim newX As Double: newX = minX * scaleX
+    Dim newY As Double: newY = (pageH - maxY) * scaleY
+    Dim newW As Double: newW = (maxX - minX) * scaleX
+    Dim newH As Double: newH = (maxY - minY) * scaleY
+    If newW <= 0 Or newH <= 0 Then Exit Sub
+
+    ' 写入新 viewBox（使用不受区域设置影响的小数格式）
+    root.setAttribute "viewBox", _
+        InvFmt(newX) & " " & InvFmt(newY) & " " & InvFmt(newW) & " " & InvFmt(newH)
+
+    xml.Save svgPath
+End Sub
+
+' 将浮点数格式化为始终使用 "." 小数点的字符串（避免区域设置影响 SVG 解析）
+Private Function InvFmt(d As Double) As String
+    InvFmt = Replace(Format(d, "0.######"), ",", ".")
+End Function
+
+' ==============================================================
+' 工具函数
+' ==============================================================
 
 ' 移除文件名中的非法字符
 Private Function SanitizeFileName(name As String) As String
@@ -123,7 +214,6 @@ Private Function SanitizeFileName(name As String) As String
     Dim i As Integer
     Dim result As String
 
-    ' Windows 文件名非法字符
     illegal = "\/:*?""<>|"
     result = name
 
@@ -131,7 +221,6 @@ Private Function SanitizeFileName(name As String) As String
         result = Join(Split(result, Mid(illegal, i, 1)), "_")
     Next i
 
-    ' 去除首尾空格及点号
     result = Trim(result)
     Do While Left(result, 1) = "." : result = Mid(result, 2) : Loop
     Do While Right(result, 1) = "." : result = Left(result, Len(result) - 1) : Loop
@@ -160,8 +249,7 @@ Private Function UniqueFilePath(path As String) As String
         ext = ""
     End If
 
-    Dim n As Long
-    n = 1
+    Dim n As Long: n = 1
     Dim candidate As String
     Do
         candidate = base & " (" & n & ")" & ext
